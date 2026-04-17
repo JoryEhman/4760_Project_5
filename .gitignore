@@ -3,3 +3,4 @@
 *.o
 oss
 user_proc
+*.dSYM/

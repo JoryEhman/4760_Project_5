@@ -40,7 +40,6 @@ static void logWrite(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    /* Count newlines */
     for (char *p = buf; *p; p++)
         if (*p == '\n') logLines++;
 
@@ -69,15 +68,39 @@ static void cleanup(int sig) {
     exit(0);
 }
 
+/* ── Advance clock by given nanoseconds ──────────────────────────────────── */
+static void advanceClock(unsigned int ns) {
+    simClock->nanoseconds += ns;
+    while (simClock->nanoseconds >= BILLION) {
+        simClock->seconds++;
+        simClock->nanoseconds -= BILLION;
+    }
+}
+
+/* ── Find free slot in process table ────────────────────────────────────── */
+static int findFreeSlot(void) {
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (!processTable[i].occupied) return i;
+    return -1;
+}
+
+/* ── Count active processes ──────────────────────────────────────────────── */
+static int countActive(void) {
+    int count = 0;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (processTable[i].occupied) count++;
+    return count;
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
 
     /* ── Default options ── */
-    int  n       = 18;
-    int  s       = 18;
-    int  t       = 5;
+    int    n     = 18;
+    int    s     = 18;
+    int    t     = 5;
     double i_val = 0.5;
-    char logfile[256] = "oss.log";
+    char   logfile[256] = "oss.log";
 
     /* ── Parse arguments ── */
     int opt;
@@ -87,14 +110,15 @@ int main(int argc, char *argv[]) {
                 printf("Usage: %s [-h] [-n proc] [-s simul] [-t timeLimit]"
                        " [-i fraction] [-f logfile]\n", argv[0]);
                 return 0;
-            case 'n': n     = atoi(optarg);  break;
-            case 's': s     = atoi(optarg);  break;
-            case 't': t     = atoi(optarg);  break;
-            case 'i': i_val = atof(optarg);  break;
+            case 'n': n     = atoi(optarg); break;
+            case 's': s     = atoi(optarg); break;
+            case 't': t     = atoi(optarg); break;
+            case 'i': i_val = atof(optarg); break;
             case 'f': strncpy(logfile, optarg, sizeof(logfile) - 1); break;
             default:
                 fprintf(stderr, "Usage: %s [-h] [-n proc] [-s simul]"
-                        " [-t timeLimit] [-i fraction] [-f logfile]\n", argv[0]);
+                        " [-t timeLimit] [-i fraction] [-f logfile]\n",
+                        argv[0]);
                 return 1;
         }
     }
@@ -136,9 +160,9 @@ int main(int argc, char *argv[]) {
 
     /* ── Initialize process table ── */
     for (int i = 0; i < MAX_PROCS; i++) {
-        processTable[i].occupied        = 0;
-        processTable[i].pid             = 0;
-        processTable[i].blocked         = 0;
+        processTable[i].occupied          = 0;
+        processTable[i].pid               = 0;
+        processTable[i].blocked           = 0;
         processTable[i].requestedResource = -1;
         for (int r = 0; r < NUM_RESOURCES; r++)
             processTable[i].resourcesAllocated[r] = 0;
@@ -150,14 +174,88 @@ int main(int argc, char *argv[]) {
         resourceTable[r].available = INSTANCES_PER_RESOURCE;
     }
 
-    /* ── Confirm startup ── */
     logWrite("OSS: Starting. n=%d s=%d t=%d i=%.2f logfile=%s\n",
              n, s, t, i_val, logfile);
-    logWrite("OSS: IPC initialized. Clock at %u:%u\n",
-             simClock->seconds, simClock->nanoseconds);
-    logWrite("OSS: Resource table initialized (%d resources, %d instances each)\n",
-             NUM_RESOURCES, INSTANCES_PER_RESOURCE);
 
+    /* ── Fork one child to test message passing ── */
+    int slot = findFreeSlot();
+    if (slot == -1) {
+        fprintf(stderr, "OSS: No free slot\n");
+        cleanup(0);
+        return 1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        cleanup(0);
+        return 1;
+    }
+
+    if (pid == 0) {
+        /* Child: exec user_proc with max time as argument */
+        char tStr[16];
+        snprintf(tStr, sizeof(tStr), "%d", t);
+        execl("./user_proc", "user_proc", tStr, NULL);
+        perror("execl");
+        exit(1);
+    }
+
+    /* Parent: fill in PCB */
+    processTable[slot].occupied          = 1;
+    processTable[slot].pid               = pid;
+    processTable[slot].startSeconds      = (int)simClock->seconds;
+    processTable[slot].startNano         = (int)simClock->nanoseconds;
+    processTable[slot].blocked           = 0;
+    processTable[slot].requestedResource = -1;
+
+    logWrite("OSS: Launched user_proc PID %d in slot %d at %u:%u\n",
+             pid, slot, simClock->seconds, simClock->nanoseconds);
+
+    /* ── Simple message loop — just test back and forth ── */
+    int running = 1;
+    while (running) {
+
+        /* Advance clock by 10ms each iteration */
+        advanceClock(10000000);
+
+        if (countActive() == 0) break;
+
+        /* Send go-ahead to child */
+        msgbuffer msg;
+        msg.mtype   = (long)pid;
+        msg.intData = 1;
+
+        logWrite("OSS: Sending message to PID %d at %u:%09u\n",
+                 pid, simClock->seconds, simClock->nanoseconds);
+
+        if (msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0) == -1) {
+            perror("msgsnd");
+            break;
+        }
+
+        /* Wait for reply */
+        msgbuffer reply;
+        if (msgrcv(msqid, &reply, sizeof(msgbuffer) - sizeof(long),
+                   getpid(), 0) == -1) {
+            perror("msgrcv");
+            break;
+        }
+
+        logWrite("OSS: Received reply from PID %d, intData=%d at %u:%09u\n",
+                 pid, reply.intData,
+                 simClock->seconds, simClock->nanoseconds);
+
+        if (reply.intData == 0) {
+            /* Child terminating */
+            logWrite("OSS: PID %d terminating\n", pid);
+            waitpid(pid, NULL, 0);
+            processTable[slot].occupied = 0;
+            running = 0;
+        }
+    }
+
+    logWrite("OSS: Done.\n");
     cleanup(0);
     return 0;
 }

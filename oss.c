@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -18,6 +19,9 @@
 #include <signal.h>
 #include <stdarg.h>
 #include "shared.h"
+
+/* ── Schedule one unblocked process (round-robin) ── */
+static int lastScheduled = 0;
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 SimClock *simClock = NULL;
@@ -85,12 +89,39 @@ static int findFreeSlot(void) {
 }
 
 /* ── Count active processes ──────────────────────────────────────────────── */
-__attribute__((unused))
 static int countActive(void) {
     int count = 0;
     for (int i = 0; i < MAX_PROCS; i++)
         if (processTable[i].occupied) count++;
     return count;
+}
+
+/* ── Launch a child process ──────────────────────────────────────────────── */
+static int launchChild(int slot, int t) {
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+
+    if (pid == 0) {
+        char tStr[16];
+        snprintf(tStr, sizeof(tStr), "%d", t);
+        execl("./user_proc", "user_proc", tStr, NULL);
+        perror("execl");
+        exit(1);
+    }
+
+    /* Parent: fill PCB */
+    processTable[slot].occupied          = 1;
+    processTable[slot].pid               = pid;
+    processTable[slot].startSeconds      = (int)simClock->seconds;
+    processTable[slot].startNano         = (int)simClock->nanoseconds;
+    processTable[slot].blocked           = 0;
+    processTable[slot].requestedResource = -1;
+    for (int r = 0; r < NUM_RESOURCES; r++)
+        processTable[slot].resourcesAllocated[r] = 0;
+
+    logWrite("OSS: Launched user_proc PID %d in slot %d at %u:%09u\n",
+             pid, slot, simClock->seconds, simClock->nanoseconds);
+    return 0;
 }
 
 /* ── Main ────────────────────────────────────────────────────────────────── */
@@ -130,10 +161,16 @@ int main(int argc, char *argv[]) {
     if (n < 1) n = 1;
     if (t < 1) t = 1;
 
-    /* ── Signal handlers ── */
-    signal(SIGINT,  cleanup);
-    signal(SIGTERM, cleanup);
-    signal(SIGALRM, cleanup);
+    /* ── Signal handlers ──
+     * Use sigaction with no SA_RESTART so that msgrcv() is interrupted
+     * by SIGALRM, allowing the 5-second limit to actually terminate us */
+    struct sigaction sa;
+    sa.sa_handler = cleanup;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* no SA_RESTART */
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
     alarm(5);
 
     /* ── Open log file ── */
@@ -178,62 +215,52 @@ int main(int argc, char *argv[]) {
     logWrite("OSS: Starting. n=%d s=%d t=%d i=%.2f logfile=%s\n",
              n, s, t, i_val, logfile);
 
-    /* ── Fork one child to test message passing ── */
-    int slot = findFreeSlot();
-    if (slot == -1) {
-        fprintf(stderr, "OSS: No free slot\n");
-        cleanup(0);
-        return 1;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        cleanup(0);
-        return 1;
-    }
-
-    if (pid == 0) {
-        /* Child: exec user_proc with max time as argument */
-        char tStr[16];
-        snprintf(tStr, sizeof(tStr), "%d", t);
-        execl("./user_proc", "user_proc", tStr, NULL);
-        perror("execl");
-        exit(1);
-    }
-
-    /* Parent: fill in PCB */
-    processTable[slot].occupied          = 1;
-    processTable[slot].pid               = pid;
-    processTable[slot].startSeconds      = (int)simClock->seconds;
-    processTable[slot].startNano         = (int)simClock->nanoseconds;
-    processTable[slot].blocked           = 0;
-    processTable[slot].requestedResource = -1;
-
-    logWrite("OSS: Launched user_proc PID %d in slot %d at %u:%u\n",
-             pid, slot, simClock->seconds, simClock->nanoseconds);
-
     /* ── Statistics ── */
     int totalRequests      = 0;
     int grantedImmediately = 0;
 
+    /* ── Launch timing ── */
+    int launched = 0;
+    unsigned long long lastLaunchNs  = 0;
+    unsigned long long intervalNs    =
+        (unsigned long long)(i_val * (double)BILLION);
+
+    /* ── Half-second table print tracking ── */
+    unsigned long long lastPrintNs = 0;
+
     /* ── Main loop ── */
-    int launched = 1;  /* we already launched one */
-    int running  = 1;
+    while (launched < n || countActive() > 0) {
 
-    while (launched < n || running > 0) {
+        /* Current simulated time in ns */
+        unsigned long long nowNs =
+            (unsigned long long)simClock->seconds * BILLION +
+            simClock->nanoseconds;
 
-        /* Advance clock by 10ms */
+        /* ── Try to launch a new child ── */
+        if (launched < n && countActive() < s) {
+            if (launched == 0 || nowNs - lastLaunchNs >= intervalNs) {
+                int slot = findFreeSlot();
+                if (slot != -1) {
+                    if (launchChild(slot, t) == 0) {
+                        launched++;
+                        lastLaunchNs = nowNs;
+                    }
+                }
+            }
+        }
+
+        /* ── Advance clock by 10ms ── */
         advanceClock(10000000);
+        nowNs = (unsigned long long)simClock->seconds * BILLION +
+                simClock->nanoseconds;
 
-        /* Check if any blocked process can now be unblocked */
+        /* ── Unblock any waiting process whose resource is now free ── */
         for (int i = 0; i < MAX_PROCS; i++) {
             if (!processTable[i].occupied) continue;
             if (!processTable[i].blocked)  continue;
 
             int r = processTable[i].requestedResource;
             if (r >= 0 && resourceTable[r].available > 0) {
-                /* Grant it */
                 resourceTable[r].available--;
                 processTable[i].resourcesAllocated[r]++;
                 processTable[i].blocked           = 0;
@@ -242,7 +269,6 @@ int main(int argc, char *argv[]) {
                 logWrite("OSS: Unblocking P%d, granting R%d at %u:%09u\n",
                          i, r, simClock->seconds, simClock->nanoseconds);
 
-                /* Send grant message */
                 msgbuffer grantMsg;
                 grantMsg.mtype   = (long)processTable[i].pid;
                 grantMsg.intData = 1;
@@ -251,10 +277,15 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Send message to one unblocked process */
-        for (int i = 0; i < MAX_PROCS; i++) {
+        /* ── Schedule one unblocked process (round-robin) ── */
+        int scheduled = 0;
+        for (int count = 0; count < MAX_PROCS && !scheduled; count++) {
+            int i = (lastScheduled + count) % MAX_PROCS;
             if (!processTable[i].occupied) continue;
             if (processTable[i].blocked)   continue;
+
+            lastScheduled = (i + 1) % MAX_PROCS;
+            scheduled = 1;
 
             msgbuffer msg;
             msg.mtype   = (long)processTable[i].pid;
@@ -266,20 +297,22 @@ int main(int argc, char *argv[]) {
 
             msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
 
-            /* Wait for reply */
+            /* Wait for reply — SIGALRM will interrupt this if time expires */
             msgbuffer reply;
-            msgrcv(msqid, &reply, sizeof(msgbuffer) - sizeof(long),
-                   getpid(), 0);
+            if (msgrcv(msqid, &reply, sizeof(msgbuffer) - sizeof(long),
+                       getpid(), 0) == -1) {
+                if (errno == EINTR) cleanup(0);
+                perror("msgrcv");
+                cleanup(0);
+            }
 
             int val = reply.intData;
 
             if (val == 0) {
-                /* Terminating */
                 logWrite("OSS: P%d PID %d terminating at %u:%09u\n",
                          i, processTable[i].pid,
                          simClock->seconds, simClock->nanoseconds);
 
-                /* Release all resources */
                 for (int r = 0; r < NUM_RESOURCES; r++) {
                     resourceTable[r].available +=
                         processTable[i].resourcesAllocated[r];
@@ -288,10 +321,8 @@ int main(int argc, char *argv[]) {
 
                 waitpid(processTable[i].pid, NULL, 0);
                 processTable[i].occupied = 0;
-                running--;
 
             } else if (val > 0) {
-                /* Resource request: resource index = val - 1 */
                 int r = val - 1;
                 totalRequests++;
 
@@ -299,7 +330,6 @@ int main(int argc, char *argv[]) {
                          i, r, simClock->seconds, simClock->nanoseconds);
 
                 if (resourceTable[r].available > 0) {
-                    /* Grant immediately */
                     resourceTable[r].available--;
                     processTable[i].resourcesAllocated[r]++;
                     grantedImmediately++;
@@ -313,7 +343,6 @@ int main(int argc, char *argv[]) {
                     msgsnd(msqid, &grantMsg,
                            sizeof(msgbuffer) - sizeof(long), 0);
                 } else {
-                    /* Block the process */
                     logWrite("OSS: R%d unavailable, blocking P%d at %u:%09u\n",
                              r, i, simClock->seconds, simClock->nanoseconds);
 
@@ -322,7 +351,6 @@ int main(int argc, char *argv[]) {
                 }
 
             } else {
-                /* Resource release: resource index = (-val) - 1 */
                 int r = (-val) - 1;
 
                 logWrite("OSS: P%d releasing R%d at %u:%09u\n",
@@ -333,14 +361,37 @@ int main(int argc, char *argv[]) {
                     resourceTable[r].available++;
                 }
 
-                /* Acknowledge */
                 msgbuffer ack;
                 ack.mtype   = (long)processTable[i].pid;
                 ack.intData = 1;
                 msgsnd(msqid, &ack, sizeof(msgbuffer) - sizeof(long), 0);
             }
+        }
 
-            break; /* one process per iteration */
+        /* ── Print process table every 500ms simulated time ── */
+        if (nowNs - lastPrintNs >= 500000000ULL) {
+            logWrite("\n--- Process Table @ %u:%09u ---\n",
+                     simClock->seconds, simClock->nanoseconds);
+            logWrite("%-5s %-8s %-8s %-12s Allocated[R0..R9]\n",
+                     "Slot", "PID", "Blocked", "ReqRes");
+            for (int i = 0; i < MAX_PROCS; i++) {
+                if (!processTable[i].occupied) continue;
+                logWrite("%-5d %-8d %-8d %-12d",
+                         i, processTable[i].pid,
+                         processTable[i].blocked,
+                         processTable[i].requestedResource);
+                for (int r = 0; r < NUM_RESOURCES; r++)
+                    logWrite(" %d",
+                             processTable[i].resourcesAllocated[r]);
+                logWrite("\n");
+            }
+
+            logWrite("\nResources available:\n");
+            for (int r = 0; r < NUM_RESOURCES; r++)
+                logWrite("R%d:%d ", r, resourceTable[r].available);
+            logWrite("\n---\n\n");
+
+            lastPrintNs = nowNs;
         }
     }
 
@@ -349,11 +400,13 @@ int main(int argc, char *argv[]) {
         ? (double)grantedImmediately / totalRequests * 100.0 : 0.0;
 
     logWrite("\n=== OSS Final Report ===\n");
+    logWrite("Total launched:           %d\n", launched);
     logWrite("Total requests:           %d\n", totalRequests);
     logWrite("Granted immediately:      %d (%.1f%%)\n",
              grantedImmediately, pct);
     logWrite("Final simulated time:     %u:%09u\n",
              simClock->seconds, simClock->nanoseconds);
+
     cleanup(0);
     return 0;
 }

@@ -124,6 +124,125 @@ static int launchChild(int slot, int t) {
     return 0;
 }
 
+/* ── Deadlock detection (Banker's algorithm) ─────────────────────────────── */
+/*
+ * Returns 1 if deadlock detected, populates deadlocked[] with PCB indices
+ * of deadlocked processes and sets count to how many there are.
+ * Algorithm:
+ *   Work[] = available[]
+ *   Finish[i] = false for all occupied slots
+ *   Find i where Finish[i]==false and Need[i] <= Work[]
+ *   If found: Work += Allocation[i], Finish[i]=true, repeat
+ *   Any Finish[i]==false at end = deadlocked
+ */
+static int detectDeadlock(int *deadlocked, int *count) {
+    int work[NUM_RESOURCES];
+    int finish[MAX_PROCS];
+    *count = 0;
+
+    for (int r = 0; r < NUM_RESOURCES; r++)
+        work[r] = resourceTable[r].available;
+
+    for (int i = 0; i < MAX_PROCS; i++)
+        finish[i] = !processTable[i].occupied;
+
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (finish[i]) continue;
+
+            /* Non-blocked process can always finish */
+            if (!processTable[i].blocked) {
+                finish[i] = 1;
+                for (int r = 0; r < NUM_RESOURCES; r++)
+                    work[r] += processTable[i].resourcesAllocated[r];
+                changed = 1;
+                continue;
+            }
+
+            /* Blocked: check if its needed resource is in work */
+            int need = processTable[i].requestedResource;
+            if (need >= 0 && work[need] >= 1) {
+                finish[i] = 1;
+                work[need]--;
+                for (int r = 0; r < NUM_RESOURCES; r++)
+                    work[r] += processTable[i].resourcesAllocated[r];
+                work[need]++;
+                changed = 1;
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (!finish[i])
+            deadlocked[(*count)++] = i;
+
+    return (*count > 0) ? 1 : 0;
+}
+
+/* ── Resolve deadlock by killing one process at a time ───────────────────── */
+static void resolveDeadlock(int *deadlockKills) {
+    int deadlocked[MAX_PROCS];
+    int count = 0;
+
+    while (detectDeadlock(deadlocked, &count) && count > 0) {
+
+        logWrite("OSS: Deadlock detected among: ");
+        for (int k = 0; k < count; k++)
+            logWrite("P%d ", deadlocked[k]);
+        logWrite("at %u:%09u\n",
+                 simClock->seconds, simClock->nanoseconds);
+        logWrite("OSS: Attempting to resolve deadlock...\n");
+
+        /* Kill the first deadlocked process */
+        int victim = deadlocked[0];
+        PCB *p = &processTable[victim];
+
+        logWrite("OSS: Killing P%d PID %d\n", victim, p->pid);
+        logWrite("OSS: Resources released: ");
+        for (int r = 0; r < NUM_RESOURCES; r++)
+            if (p->resourcesAllocated[r] > 0)
+                logWrite("R%d:%d ", r, p->resourcesAllocated[r]);
+        logWrite("\n");
+
+        /* Release its resources */
+        for (int r = 0; r < NUM_RESOURCES; r++) {
+            resourceTable[r].available += p->resourcesAllocated[r];
+            p->resourcesAllocated[r] = 0;
+        }
+
+        kill(p->pid, SIGTERM);
+        waitpid(p->pid, NULL, 0);
+        p->occupied = 0;
+        p->blocked  = 0;
+        (*deadlockKills)++;
+
+        /* Unblock any process that can now run */
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (!processTable[i].occupied) continue;
+            if (!processTable[i].blocked)  continue;
+            int r = processTable[i].requestedResource;
+            if (r >= 0 && resourceTable[r].available > 0) {
+                resourceTable[r].available--;
+                processTable[i].resourcesAllocated[r]++;
+                processTable[i].blocked           = 0;
+                processTable[i].requestedResource = -1;
+
+                logWrite("OSS: Unblocking P%d, granting R%d"
+                         " after deadlock resolution\n", i, r);
+
+                msgbuffer grantMsg;
+                grantMsg.mtype   = (long)processTable[i].pid;
+                grantMsg.intData = 1;
+                msgsnd(msqid, &grantMsg,
+                       sizeof(msgbuffer) - sizeof(long), 0);
+            }
+        }
+        count = 0;
+    }
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
 
@@ -162,12 +281,11 @@ int main(int argc, char *argv[]) {
     if (t < 1) t = 1;
 
     /* ── Signal handlers ──
-     * Use sigaction with no SA_RESTART so that msgrcv() is interrupted
-     * by SIGALRM, allowing the 5-second limit to actually terminate us */
+     * No SA_RESTART so msgrcv() is interrupted by SIGALRM */
     struct sigaction sa;
     sa.sa_handler = cleanup;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;  /* no SA_RESTART */
+    sa.sa_flags = 0;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGALRM, &sa, NULL);
@@ -218,20 +336,23 @@ int main(int argc, char *argv[]) {
     /* ── Statistics ── */
     int totalRequests      = 0;
     int grantedImmediately = 0;
+    int deadlockRuns       = 0;
+    int deadlockKills      = 0;
+    int grantedCount       = 0;
 
     /* ── Launch timing ── */
     int launched = 0;
-    unsigned long long lastLaunchNs  = 0;
-    unsigned long long intervalNs    =
+    unsigned long long lastLaunchNs   = 0;
+    unsigned long long intervalNs     =
         (unsigned long long)(i_val * (double)BILLION);
 
-    /* ── Half-second table print tracking ── */
-    unsigned long long lastPrintNs = 0;
+    /* ── Timing trackers ── */
+    unsigned long long lastPrintNs    = 0;
+    unsigned long long lastDeadlockNs = 0;
 
     /* ── Main loop ── */
     while (launched < n || countActive() > 0) {
 
-        /* Current simulated time in ns */
         unsigned long long nowNs =
             (unsigned long long)simClock->seconds * BILLION +
             simClock->nanoseconds;
@@ -297,7 +418,7 @@ int main(int argc, char *argv[]) {
 
             msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
 
-            /* Wait for reply — SIGALRM will interrupt this if time expires */
+            /* Wait for reply — SIGALRM interrupts if time expires */
             msgbuffer reply;
             if (msgrcv(msqid, &reply, sizeof(msgbuffer) - sizeof(long),
                        getpid(), 0) == -1) {
@@ -309,6 +430,7 @@ int main(int argc, char *argv[]) {
             int val = reply.intData;
 
             if (val == 0) {
+                /* ── Terminating ── */
                 logWrite("OSS: P%d PID %d terminating at %u:%09u\n",
                          i, processTable[i].pid,
                          simClock->seconds, simClock->nanoseconds);
@@ -323,6 +445,7 @@ int main(int argc, char *argv[]) {
                 processTable[i].occupied = 0;
 
             } else if (val > 0) {
+                /* ── Resource request ── */
                 int r = val - 1;
                 totalRequests++;
 
@@ -333,28 +456,54 @@ int main(int argc, char *argv[]) {
                     resourceTable[r].available--;
                     processTable[i].resourcesAllocated[r]++;
                     grantedImmediately++;
+                    grantedCount++;
 
                     logWrite("OSS: Granting R%d to P%d at %u:%09u\n",
-                             r, i, simClock->seconds, simClock->nanoseconds);
+                             r, i,
+                             simClock->seconds, simClock->nanoseconds);
 
                     msgbuffer grantMsg;
                     grantMsg.mtype   = (long)processTable[i].pid;
                     grantMsg.intData = 1;
                     msgsnd(msqid, &grantMsg,
                            sizeof(msgbuffer) - sizeof(long), 0);
+
+                    /* Every 20 grants print allocation table */
+                    if (grantedCount % 20 == 0) {
+                        logWrite("\n--- Allocation Table"
+                                 " (every 20 grants) ---\n");
+                        logWrite("     ");
+                        for (int r2 = 0; r2 < NUM_RESOURCES; r2++)
+                            logWrite("R%-3d ", r2);
+                        logWrite("\n");
+                        for (int j = 0; j < MAX_PROCS; j++) {
+                            if (!processTable[j].occupied) continue;
+                            logWrite("P%-4d", j);
+                            for (int r2 = 0; r2 < NUM_RESOURCES; r2++)
+                                logWrite("%-4d ",
+                                    processTable[j].resourcesAllocated[r2]);
+                            logWrite("\n");
+                        }
+                        logWrite("---\n\n");
+                    }
+
                 } else {
-                    logWrite("OSS: R%d unavailable, blocking P%d at %u:%09u\n",
-                             r, i, simClock->seconds, simClock->nanoseconds);
+                    logWrite("OSS: R%d unavailable, blocking P%d"
+                             " at %u:%09u\n",
+                             r, i,
+                             simClock->seconds, simClock->nanoseconds);
 
                     processTable[i].blocked           = 1;
                     processTable[i].requestedResource = r;
                 }
 
             } else {
+                /* ── Resource release ── */
                 int r = (-val) - 1;
 
                 logWrite("OSS: P%d releasing R%d at %u:%09u\n",
-                         i, r, simClock->seconds, simClock->nanoseconds);
+                         i, r,
+                         simClock->seconds, simClock->nanoseconds);
 
                 if (processTable[i].resourcesAllocated[r] > 0) {
                     processTable[i].resourcesAllocated[r]--;
@@ -393,6 +542,15 @@ int main(int argc, char *argv[]) {
 
             lastPrintNs = nowNs;
         }
+
+        /* ── Deadlock detection every 1 second simulated time ── */
+        if (nowNs - lastDeadlockNs >= 1000000000ULL) {
+            deadlockRuns++;
+            logWrite("\nOSS: Running deadlock detection at %u:%09u\n",
+                     simClock->seconds, simClock->nanoseconds);
+            resolveDeadlock(&deadlockKills);
+            lastDeadlockNs = nowNs;
+        }
     }
 
     /* ── Final report ── */
@@ -404,6 +562,8 @@ int main(int argc, char *argv[]) {
     logWrite("Total requests:           %d\n", totalRequests);
     logWrite("Granted immediately:      %d (%.1f%%)\n",
              grantedImmediately, pct);
+    logWrite("Deadlock detection runs:  %d\n", deadlockRuns);
+    logWrite("Processes killed:         %d\n", deadlockKills);
     logWrite("Final simulated time:     %u:%09u\n",
              simClock->seconds, simClock->nanoseconds);
 

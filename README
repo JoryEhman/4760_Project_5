@@ -1,0 +1,17 @@
+Name: ehman
+Date: 2026-04-17
+Environment: Linux, gcc
+
+How to compile:
+  make
+
+How to run:
+  ./oss -n 3 -s 2 -t 4 -i 0.6 -f oss.log
+
+Generative AI used: Claude (Anthropic)
+Prompts:
+  Help me build Project 5 incrementally starting from Project 3 base
+  Explain ftok() and IPC key uniqueness on a shared server
+
+Summary: Used Claude to understand IPC key generation and build
+the project incrementally.

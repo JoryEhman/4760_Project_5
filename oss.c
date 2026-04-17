@@ -20,7 +20,7 @@
 #include <stdarg.h>
 #include "shared.h"
 
-/* ── Schedule one unblocked process (round-robin) ── */
+/* ── Round-robin scheduling index ───────────────────────────────────────── */
 static int lastScheduled = 0;
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
@@ -29,6 +29,7 @@ int       shmid    = -1;
 int       msqid    = -1;
 FILE     *logfp    = NULL;
 int       logLines =  0;
+static int verbose =  0;   /* -v flag: log every grant/release/block */
 
 PCB      processTable[MAX_PROCS];
 Resource resourceTable[NUM_RESOURCES];
@@ -255,19 +256,21 @@ int main(int argc, char *argv[]) {
 
     /* ── Parse arguments ── */
     int opt;
-    while ((opt = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
+    while ((opt = getopt(argc, argv, "hvn:s:t:i:f:")) != -1) {
         switch (opt) {
             case 'h':
-                printf("Usage: %s [-h] [-n proc] [-s simul] [-t timeLimit]"
-                       " [-i fraction] [-f logfile]\n", argv[0]);
+                printf("Usage: %s [-h] [-v] [-n proc] [-s simul]"
+                       " [-t timeLimit] [-i fraction] [-f logfile]\n",
+                       argv[0]);
                 return 0;
+            case 'v': verbose = 1; break;
             case 'n': n     = atoi(optarg); break;
             case 's': s     = atoi(optarg); break;
             case 't': t     = atoi(optarg); break;
             case 'i': i_val = atof(optarg); break;
             case 'f': strncpy(logfile, optarg, sizeof(logfile) - 1); break;
             default:
-                fprintf(stderr, "Usage: %s [-h] [-n proc] [-s simul]"
+                fprintf(stderr, "Usage: %s [-h] [-v] [-n proc] [-s simul]"
                         " [-t timeLimit] [-i fraction] [-f logfile]\n",
                         argv[0]);
                 return 1;
@@ -330,8 +333,8 @@ int main(int argc, char *argv[]) {
         resourceTable[r].available = INSTANCES_PER_RESOURCE;
     }
 
-    logWrite("OSS: Starting. n=%d s=%d t=%d i=%.2f logfile=%s\n",
-             n, s, t, i_val, logfile);
+    logWrite("OSS: Starting. n=%d s=%d t=%d i=%.2f logfile=%s verbose=%s\n",
+             n, s, t, i_val, logfile, verbose ? "on" : "off");
 
     /* ── Statistics ── */
     int totalRequests      = 0;
@@ -412,9 +415,10 @@ int main(int argc, char *argv[]) {
             msg.mtype   = (long)processTable[i].pid;
             msg.intData = 1;
 
-            logWrite("OSS: Sending message to P%d PID %d at %u:%09u\n",
-                     i, processTable[i].pid,
-                     simClock->seconds, simClock->nanoseconds);
+            if (verbose)
+                logWrite("OSS: Sending message to P%d PID %d at %u:%09u\n",
+                         i, processTable[i].pid,
+                         simClock->seconds, simClock->nanoseconds);
 
             msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
 
@@ -449,8 +453,10 @@ int main(int argc, char *argv[]) {
                 int r = val - 1;
                 totalRequests++;
 
-                logWrite("OSS: P%d requesting R%d at %u:%09u\n",
-                         i, r, simClock->seconds, simClock->nanoseconds);
+                if (verbose)
+                    logWrite("OSS: P%d requesting R%d at %u:%09u\n",
+                             i, r,
+                             simClock->seconds, simClock->nanoseconds);
 
                 if (resourceTable[r].available > 0) {
                     resourceTable[r].available--;
@@ -458,9 +464,10 @@ int main(int argc, char *argv[]) {
                     grantedImmediately++;
                     grantedCount++;
 
-                    logWrite("OSS: Granting R%d to P%d at %u:%09u\n",
-                             r, i,
-                             simClock->seconds, simClock->nanoseconds);
+                    if (verbose)
+                        logWrite("OSS: Granting R%d to P%d at %u:%09u\n",
+                                 r, i,
+                                 simClock->seconds, simClock->nanoseconds);
 
                     msgbuffer grantMsg;
                     grantMsg.mtype   = (long)processTable[i].pid;
@@ -488,6 +495,7 @@ int main(int argc, char *argv[]) {
                     }
 
                 } else {
+                    /* Block — always log */
                     logWrite("OSS: R%d unavailable, blocking P%d"
                              " at %u:%09u\n",
                              r, i,
@@ -501,9 +509,10 @@ int main(int argc, char *argv[]) {
                 /* ── Resource release ── */
                 int r = (-val) - 1;
 
-                logWrite("OSS: P%d releasing R%d at %u:%09u\n",
-                         i, r,
-                         simClock->seconds, simClock->nanoseconds);
+                if (verbose)
+                    logWrite("OSS: P%d releasing R%d at %u:%09u\n",
+                             i, r,
+                             simClock->seconds, simClock->nanoseconds);
 
                 if (processTable[i].resourcesAllocated[r] > 0) {
                     processTable[i].resourcesAllocated[r]--;

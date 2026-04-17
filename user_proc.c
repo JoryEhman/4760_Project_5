@@ -15,7 +15,7 @@
 #include <sys/msg.h>
 #include "shared.h"
 
-int main(int argc, char *argv[]) {
+int main(void) {
 
     key_t shmkey = ftok(SHM_KEY_PATH, SHM_KEY_ID);
     if (shmkey == -1) { perror("ftok shm"); return 1; }

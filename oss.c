@@ -23,13 +23,14 @@ int shmid = -1;
 int msqid = -1;
 
 static void cleanup(int sig) {
+    (void)sig;
     if (simClock) shmdt(simClock);
     if (shmid != -1) shmctl(shmid, IPC_RMID, NULL);
     if (msqid != -1) msgctl(msqid, IPC_RMID, NULL);
     exit(0);
 }
 
-int main(int argc, char *argv[]) {
+int main(void) {
 
     signal(SIGINT, cleanup);
     signal(SIGALRM, cleanup);

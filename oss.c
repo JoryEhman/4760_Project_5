@@ -85,6 +85,7 @@ static int findFreeSlot(void) {
 }
 
 /* ── Count active processes ──────────────────────────────────────────────── */
+__attribute__((unused))
 static int countActive(void) {
     int count = 0;
     for (int i = 0; i < MAX_PROCS; i++)
@@ -212,50 +213,147 @@ int main(int argc, char *argv[]) {
     logWrite("OSS: Launched user_proc PID %d in slot %d at %u:%u\n",
              pid, slot, simClock->seconds, simClock->nanoseconds);
 
-    /* ── Simple message loop — just test back and forth ── */
-    int running = 1;
-    while (running) {
+    /* ── Statistics ── */
+    int totalRequests      = 0;
+    int grantedImmediately = 0;
 
-        /* Advance clock by 10ms each iteration */
+    /* ── Main loop ── */
+    int launched = 1;  /* we already launched one */
+    int running  = 1;
+
+    while (launched < n || running > 0) {
+
+        /* Advance clock by 10ms */
         advanceClock(10000000);
 
-        if (countActive() == 0) break;
+        /* Check if any blocked process can now be unblocked */
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (!processTable[i].occupied) continue;
+            if (!processTable[i].blocked)  continue;
 
-        /* Send go-ahead to child */
-        msgbuffer msg;
-        msg.mtype   = (long)pid;
-        msg.intData = 1;
+            int r = processTable[i].requestedResource;
+            if (r >= 0 && resourceTable[r].available > 0) {
+                /* Grant it */
+                resourceTable[r].available--;
+                processTable[i].resourcesAllocated[r]++;
+                processTable[i].blocked           = 0;
+                processTable[i].requestedResource = -1;
 
-        logWrite("OSS: Sending message to PID %d at %u:%09u\n",
-                 pid, simClock->seconds, simClock->nanoseconds);
+                logWrite("OSS: Unblocking P%d, granting R%d at %u:%09u\n",
+                         i, r, simClock->seconds, simClock->nanoseconds);
 
-        if (msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0) == -1) {
-            perror("msgsnd");
-            break;
+                /* Send grant message */
+                msgbuffer grantMsg;
+                grantMsg.mtype   = (long)processTable[i].pid;
+                grantMsg.intData = 1;
+                msgsnd(msqid, &grantMsg,
+                       sizeof(msgbuffer) - sizeof(long), 0);
+            }
         }
 
-        /* Wait for reply */
-        msgbuffer reply;
-        if (msgrcv(msqid, &reply, sizeof(msgbuffer) - sizeof(long),
-                   getpid(), 0) == -1) {
-            perror("msgrcv");
-            break;
-        }
+        /* Send message to one unblocked process */
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (!processTable[i].occupied) continue;
+            if (processTable[i].blocked)   continue;
 
-        logWrite("OSS: Received reply from PID %d, intData=%d at %u:%09u\n",
-                 pid, reply.intData,
-                 simClock->seconds, simClock->nanoseconds);
+            msgbuffer msg;
+            msg.mtype   = (long)processTable[i].pid;
+            msg.intData = 1;
 
-        if (reply.intData == 0) {
-            /* Child terminating */
-            logWrite("OSS: PID %d terminating\n", pid);
-            waitpid(pid, NULL, 0);
-            processTable[slot].occupied = 0;
-            running = 0;
+            logWrite("OSS: Sending message to P%d PID %d at %u:%09u\n",
+                     i, processTable[i].pid,
+                     simClock->seconds, simClock->nanoseconds);
+
+            msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+
+            /* Wait for reply */
+            msgbuffer reply;
+            msgrcv(msqid, &reply, sizeof(msgbuffer) - sizeof(long),
+                   getpid(), 0);
+
+            int val = reply.intData;
+
+            if (val == 0) {
+                /* Terminating */
+                logWrite("OSS: P%d PID %d terminating at %u:%09u\n",
+                         i, processTable[i].pid,
+                         simClock->seconds, simClock->nanoseconds);
+
+                /* Release all resources */
+                for (int r = 0; r < NUM_RESOURCES; r++) {
+                    resourceTable[r].available +=
+                        processTable[i].resourcesAllocated[r];
+                    processTable[i].resourcesAllocated[r] = 0;
+                }
+
+                waitpid(processTable[i].pid, NULL, 0);
+                processTable[i].occupied = 0;
+                running--;
+
+            } else if (val > 0) {
+                /* Resource request: resource index = val - 1 */
+                int r = val - 1;
+                totalRequests++;
+
+                logWrite("OSS: P%d requesting R%d at %u:%09u\n",
+                         i, r, simClock->seconds, simClock->nanoseconds);
+
+                if (resourceTable[r].available > 0) {
+                    /* Grant immediately */
+                    resourceTable[r].available--;
+                    processTable[i].resourcesAllocated[r]++;
+                    grantedImmediately++;
+
+                    logWrite("OSS: Granting R%d to P%d at %u:%09u\n",
+                             r, i, simClock->seconds, simClock->nanoseconds);
+
+                    msgbuffer grantMsg;
+                    grantMsg.mtype   = (long)processTable[i].pid;
+                    grantMsg.intData = 1;
+                    msgsnd(msqid, &grantMsg,
+                           sizeof(msgbuffer) - sizeof(long), 0);
+                } else {
+                    /* Block the process */
+                    logWrite("OSS: R%d unavailable, blocking P%d at %u:%09u\n",
+                             r, i, simClock->seconds, simClock->nanoseconds);
+
+                    processTable[i].blocked           = 1;
+                    processTable[i].requestedResource = r;
+                }
+
+            } else {
+                /* Resource release: resource index = (-val) - 1 */
+                int r = (-val) - 1;
+
+                logWrite("OSS: P%d releasing R%d at %u:%09u\n",
+                         i, r, simClock->seconds, simClock->nanoseconds);
+
+                if (processTable[i].resourcesAllocated[r] > 0) {
+                    processTable[i].resourcesAllocated[r]--;
+                    resourceTable[r].available++;
+                }
+
+                /* Acknowledge */
+                msgbuffer ack;
+                ack.mtype   = (long)processTable[i].pid;
+                ack.intData = 1;
+                msgsnd(msqid, &ack, sizeof(msgbuffer) - sizeof(long), 0);
+            }
+
+            break; /* one process per iteration */
         }
     }
 
-    logWrite("OSS: Done.\n");
+    /* ── Final report ── */
+    double pct = totalRequests > 0
+        ? (double)grantedImmediately / totalRequests * 100.0 : 0.0;
+
+    logWrite("\n=== OSS Final Report ===\n");
+    logWrite("Total requests:           %d\n", totalRequests);
+    logWrite("Granted immediately:      %d (%.1f%%)\n",
+             grantedImmediately, pct);
+    logWrite("Final simulated time:     %u:%09u\n",
+             simClock->seconds, simClock->nanoseconds);
     cleanup(0);
     return 0;
 }

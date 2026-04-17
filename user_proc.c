@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -23,6 +24,9 @@ int main(int argc, char *argv[]) {
     }
 
     int maxSeconds = atoi(argv[1]);
+
+    /* Seed RNG uniquely per process */
+    srand((unsigned)(time(NULL) ^ ((unsigned long)getpid() * 2654435761UL)));
 
     /* ── Attach to shared memory ── */
     key_t shmkey = ftok(SHM_KEY_PATH, SHM_KEY_ID);
@@ -44,12 +48,13 @@ int main(int argc, char *argv[]) {
     pid_t myPid     = getpid();
     pid_t parentPid = getppid();
 
-    /* Record birth time */
-    unsigned int birthSec  = simClock->seconds;
-    unsigned int birthNano = simClock->nanoseconds;
+    /* Track what resources we currently hold */
+    int myResources[NUM_RESOURCES];
+    for (int i = 0; i < NUM_RESOURCES; i++)
+        myResources[i] = 0;
 
-    printf("user_proc PID:%d attached. maxSeconds=%d birthTime=%u:%u\n",
-           myPid, maxSeconds, birthSec, birthNano);
+    /* Record birth time */
+    unsigned int birthSec = simClock->seconds;
 
     /* ── Main loop ── */
     while (1) {
@@ -62,16 +67,13 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        /* OSS told us to terminate */
+        /* OSS told us to terminate immediately */
         if (msg.intData == 0) break;
 
         /* Check if our time is up */
         unsigned int elapsed = simClock->seconds - birthSec;
         if ((int)elapsed >= maxSeconds) {
-            printf("user_proc PID:%d time up at %u:%u, terminating\n",
-                   myPid, simClock->seconds, simClock->nanoseconds);
-
-            /* Send termination message */
+            /* Send termination message (0) */
             msgbuffer reply;
             reply.mtype   = (long)parentPid;
             reply.intData = 0;
@@ -79,14 +81,86 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        /* Still running — send back intData=1 */
-        printf("user_proc PID:%d still running at %u:%u\n",
-               myPid, simClock->seconds, simClock->nanoseconds);
+        /* ── Decide: request (70%) or release (30%) ── */
+        int doRequest = ((rand() % 100) < 70);
 
-        msgbuffer reply;
-        reply.mtype   = (long)parentPid;
-        reply.intData = 1;
-        msgsnd(msqid, &reply, sizeof(msgbuffer) - sizeof(long), 0);
+        if (doRequest) {
+            /* Pick a random resource to request */
+            int r = rand() % NUM_RESOURCES;
+
+            /* Never hold more than INSTANCES_PER_RESOURCE of one resource */
+            if (myResources[r] >= INSTANCES_PER_RESOURCE) {
+                /* At cap for this one — try releasing instead */
+                doRequest = 0;
+            } else {
+                /* Send request: positive value = resource index + 1 */
+                msgbuffer reply;
+                reply.mtype   = (long)parentPid;
+                reply.intData = r + 1;
+                msgsnd(msqid, &reply, sizeof(msgbuffer) - sizeof(long), 0);
+
+                /* Wait for grant — OSS will reply when resource is available */
+                msgbuffer grant;
+                if (msgrcv(msqid, &grant, sizeof(msgbuffer) - sizeof(long),
+                           (long)myPid, 0) == -1) {
+                    perror("msgrcv grant");
+                    break;
+                }
+
+                /* Resource granted */
+                myResources[r]++;
+                continue;
+            }
+        }
+
+        if (!doRequest) {
+            /* Find a resource we actually hold */
+            int r = -1;
+            for (int tries = 0; tries < NUM_RESOURCES * 2; tries++) {
+                int candidate = rand() % NUM_RESOURCES;
+                if (myResources[candidate] > 0) {
+                    r = candidate;
+                    break;
+                }
+            }
+
+            if (r == -1) {
+                /* Nothing to release — request something instead */
+                int r2 = rand() % NUM_RESOURCES;
+                if (myResources[r2] < INSTANCES_PER_RESOURCE) {
+                    msgbuffer reply;
+                    reply.mtype   = (long)parentPid;
+                    reply.intData = r2 + 1;
+                    msgsnd(msqid, &reply,
+                           sizeof(msgbuffer) - sizeof(long), 0);
+
+                    msgbuffer grant;
+                    if (msgrcv(msqid, &grant,
+                               sizeof(msgbuffer) - sizeof(long),
+                               (long)myPid, 0) == -1) {
+                        perror("msgrcv grant2");
+                        break;
+                    }
+                    myResources[r2]++;
+                }
+                continue;
+            }
+
+            /* Send release: negative value = -(resource index + 1) */
+            msgbuffer reply;
+            reply.mtype   = (long)parentPid;
+            reply.intData = -(r + 1);
+            msgsnd(msqid, &reply, sizeof(msgbuffer) - sizeof(long), 0);
+            myResources[r]--;
+
+            /* Wait for OSS acknowledgement */
+            msgbuffer ack;
+            if (msgrcv(msqid, &ack, sizeof(msgbuffer) - sizeof(long),
+                       (long)myPid, 0) == -1) {
+                perror("msgrcv ack");
+                break;
+            }
+        }
     }
 
     shmdt(simClock);
